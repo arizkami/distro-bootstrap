@@ -3,11 +3,12 @@
  *
  * Build:
  * gcc -static -O2 -o bootstrap bootstrap.c
- * or for musl:
- * musl-gcc -static -O2 -o bootstrap bootstrap.c
  *
  * Usage:
- * bootstrap --archlinux | --fedora | --ubuntu | --alpine | --gentoo | --rhel | --custom=/path/to/rootfs
+ * bootstrap --custom /path/to/rootfs_folder
+ * bootstrap --custom /dev/sda3
+ * bootstrap --custom /path/to/system.img
+ * bootstrap --custom /path/to/system.squashfs
  */
 
 #define _GNU_SOURCE
@@ -29,13 +30,11 @@
 #define WARN(fmt, ...) fprintf(stderr, "[bootstrap] WARN: " fmt "\n", ##__VA_ARGS__)
 #define ERR(fmt, ...)  fprintf(stderr, "[bootstrap] ERROR: " fmt "\n", ##__VA_ARGS__)
 
-/* pivot_root is not wrapped by glibc - call it directly */
 static inline int pivot_root(const char *new_root, const char *put_old)
 {
     return (int)syscall(SYS_pivot_root, new_root, put_old);
 }
 
-/* mkdir -p: create every component of path */
 static int mkdirp(const char *path, mode_t mode)
 {
     char   tmp[4096];
@@ -57,18 +56,12 @@ static int mkdirp(const char *path, mode_t mode)
         }
     }
     if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
-        /* ignore EEXIST, surface everything else as a warning only */
         if (errno != EEXIST)
             WARN("mkdir %s: %s", tmp, strerror(errno));
     }
     return 0;
 }
 
-/*
- * do_mount_fs  - mount a virtual filesystem
- * do_mount_bind - bind-mount src -> dst
- * Both: create dst if missing, warn on failure, never abort.
- */
 static void do_mount_fs(const char *fstype, const char *src, const char *dst,
                         unsigned long flags, const char *opts)
 {
@@ -88,13 +81,47 @@ static void do_mount_bind(const char *src, const char *dst)
         LOG("  bind  %s -> %s", src, dst);
 }
 
+/* Mount a block device natively by guessing the filesystem */
+static int mount_block_device(const char *dev, const char *mnt)
+{
+    mkdirp(mnt, 0755);
+    /* Added squashfs to the detection list */
+    static const char *fs_types[] = {"ext4", "xfs", "btrfs", "ext3", "ext2", "vfat", "squashfs", NULL};
+    
+    for (int i = 0; fs_types[i] != NULL; i++) {
+        if (mount(dev, mnt, fs_types[i], 0, NULL) == 0) {
+            LOG("  mount block device %s as %s -> %s", dev, fs_types[i], mnt);
+            return 0;
+        }
+    }
+    WARN("failed to mount %s (tried ext4, xfs, btrfs, squashfs, etc.): %s", dev, strerror(errno));
+    return -1;
+}
+
+/* Mount a regular file (img/squashfs) by outsourcing to the host's mount utility for loop handling */
+static int mount_file_image(const char *file, const char *mnt)
+{
+    mkdirp(mnt, 0755);
+    char cmd[4096];
+    
+    /* Using the standard mount tool handles loop allocation and filesystem detection automatically */
+    snprintf(cmd, sizeof(cmd), "mount -o loop \"%s\" \"%s\"", file, mnt);
+    LOG("  loop mounting file: %s", file);
+    
+    int ret = system(cmd);
+    if (ret != 0) {
+        WARN("failed to loop mount image file: %s", file);
+        return -1;
+    }
+    return 0;
+}
+
 static void do_umount_lazy(const char *path)
 {
     if (umount2(path, MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT)
         WARN("umount -l %s: %s", path, strerror(errno));
 }
 
-/* Try a list of candidate paths; return first executable one or NULL */
 static const char *find_exec(const char *candidates[], int n)
 {
     struct stat st;
@@ -105,15 +132,13 @@ static const char *find_exec(const char *candidates[], int n)
     return NULL;
 }
 
-/* Safe symlink: skip if target already is a symlink, remove plain dir/file */
 static void safe_symlink(const char *target, const char *linkpath)
 {
     struct stat st;
     if (lstat(linkpath, &st) == 0) {
         if (S_ISLNK(st.st_mode))
-            return; /* already a symlink - leave it */
-        /* remove whatever is there (non-symlink) */
-        remove(linkpath); /* ignore error - rmdir/unlink */
+            return; 
+        remove(linkpath); 
     }
     if (symlink(target, linkpath) != 0)
         WARN("symlink %s -> %s: %s", target, linkpath, strerror(errno));
@@ -169,7 +194,6 @@ static const char *distro_target(Distro d)
 /* Phases                                                             */
 /* ------------------------------------------------------------------ */
 
-/* 1. Mount API filesystems on the host (outer) namespace */
 static void mount_host_api(Distro distro)
 {
     LOG("mounting host API filesystems...");
@@ -181,25 +205,19 @@ static void mount_host_api(Distro distro)
     do_mount_fs("tmpfs",     "tmpfs",  "/tmp",             0, "mode=1777");
     do_mount_fs("cgroup2",   "none",   "/sys/fs/cgroup",   0, NULL);
 
-    /* systemd-based and custom target fallback */
     if (distro == DISTRO_FEDORA || distro == DISTRO_RHEL || distro == DISTRO_CUSTOM) {
         do_mount_fs("tmpfs", "tmpfs", "/sys/fs/cgroup/unified", 0, NULL);
     }
 }
 
-/* 2. Ensure every expected mount point exists inside the target rootfs */
 static void prepare_target_mounts(const char *target, Distro distro)
 {
     LOG("preparing mount points inside %s...", target);
 
-    /* baseline set every distro needs */
     static const char *common[] = {
         "proc", "sys", "dev", "dev/pts", "dev/shm",
-        "run", "run/lock",
-        "tmp",
-        "sys/fs/cgroup",
-        "sys/kernel/debug",
-        "sys/kernel/tracing",
+        "run", "run/lock", "tmp",
+        "sys/fs/cgroup", "sys/kernel/debug", "sys/kernel/tracing",
     };
     char path[4096];
     for (size_t i = 0; i < sizeof(common)/sizeof(*common); i++) {
@@ -207,7 +225,6 @@ static void prepare_target_mounts(const char *target, Distro distro)
         mkdirp(path, 0755);
     }
 
-    /* per-distro extras */
     switch (distro) {
     case DISTRO_FEDORA:
     case DISTRO_RHEL:
@@ -234,7 +251,6 @@ static void prepare_target_mounts(const char *target, Distro distro)
     }
 }
 
-/* 3. Bind /mnt -> target, bind API filesystems into new root, pivot */
 static void do_pivot(const char *target, Distro distro)
 {
     LOG("binding %s -> /mnt...", target);
@@ -252,7 +268,6 @@ static void do_pivot(const char *target, Distro distro)
 
     mkdirp("bootstrap", 0755);
 
-    /* bind API filesystems into new root */
     LOG("binding API filesystems into new root...");
     static const char *api_fs[] = {
         "proc", "sys", "dev", "dev/pts", "run", "tmp", "sys/fs/cgroup",
@@ -264,7 +279,6 @@ static void do_pivot(const char *target, Distro distro)
         do_mount_bind(src, api_fs[i]);
     }
 
-    /* dev/shm */
     if (distro == DISTRO_UBUNTU || distro == DISTRO_ALPINE || distro == DISTRO_GENTOO) {
         mkdirp("dev/shm", 0755);
         if (mount("/dev/shm", "dev/shm", NULL, MS_BIND, NULL) != 0)
@@ -283,26 +297,18 @@ static void do_pivot(const char *target, Distro distro)
     }
 }
 
-/* 4. Lazy-unmount old root API mounts */
 static void cleanup_old_root(void)
 {
     LOG("cleaning up old root...");
     static const char *old[] = {
-        "/bootstrap/sys/fs/cgroup",
-        "/bootstrap/dev/pts",
-        "/bootstrap/dev/shm",
-        "/bootstrap/dev",
-        "/bootstrap/proc",
-        "/bootstrap/sys",
-        "/bootstrap/run",
-        "/bootstrap/tmp",
-        "/bootstrap",
+        "/bootstrap/sys/fs/cgroup", "/bootstrap/dev/pts", "/bootstrap/dev/shm",
+        "/bootstrap/dev", "/bootstrap/proc", "/bootstrap/sys",
+        "/bootstrap/run", "/bootstrap/tmp", "/bootstrap",
     };
     for (size_t i = 0; i < sizeof(old)/sizeof(*old); i++)
         do_umount_lazy(old[i]);
 }
 
-/* 5. Per-distro post-pivot fixups (symlinks, extra mounts) */
 static void post_pivot_fixups(Distro distro)
 {
     switch (distro) {
@@ -318,7 +324,6 @@ static void post_pivot_fixups(Distro distro)
         break;
     case DISTRO_GENTOO:
         safe_symlink("/run", "/var/run");
-        /* ensure /dev/shm is a real tmpfs after pivot if not bound */
         if (mount("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777") != 0 && errno != EBUSY)
             WARN("tmpfs on /dev/shm: %s", strerror(errno));
         break;
@@ -331,38 +336,23 @@ static void post_pivot_fixups(Distro distro)
     }
 }
 
-/* 6. Resolve init binary, distro-aware */
 static const char *find_init(Distro distro)
 {
     static const char *systemd_first[] = {
-        "/lib/systemd/systemd",
-        "/usr/lib/systemd/systemd",
-        "/sbin/init",
-        "/bin/init",
+        "/lib/systemd/systemd", "/usr/lib/systemd/systemd", "/sbin/init", "/bin/init",
     };
     static const char *arch_inits[] = {
-        "/usr/lib/systemd/systemd",
-        "/sbin/init",
-        "/bin/init",
+        "/usr/lib/systemd/systemd", "/sbin/init", "/bin/init",
     };
     static const char *alpine_inits[] = {
-        "/sbin/init",
-        "/bin/busybox",
-        "/bin/sh",
+        "/sbin/init", "/bin/busybox", "/bin/sh",
     };
     static const char *gentoo_inits[] = {
-        "/sbin/init",
-        "/lib/systemd/systemd",
-        "/usr/lib/systemd/systemd",
-        "/bin/sh",
+        "/sbin/init", "/lib/systemd/systemd", "/usr/lib/systemd/systemd", "/bin/sh",
     };
     static const char *custom_inits[] = {
-        "/sbin/init",
-        "/lib/systemd/systemd",
-        "/usr/lib/systemd/systemd",
-        "/bin/init",
-        "/bin/busybox",
-        "/bin/sh",
+        "/sbin/init", "/lib/systemd/systemd", "/usr/lib/systemd/systemd",
+        "/bin/init", "/bin/busybox", "/bin/sh",
     };
 
     switch (distro) {
@@ -389,9 +379,9 @@ static const char *find_init(Distro distro)
 int main(int argc, char *argv[])
 {
     /* --- parse argument --- */
-    if (argc != 2) {
+    if (argc < 2 || argc > 3) {
         fprintf(stderr,
-                "Usage: %s --archlinux|--fedora|--ubuntu|--alpine|--gentoo|--rhel|--custom=<path>\n", argv[0]);
+                "Usage: %s --archlinux|--fedora|--ubuntu|--alpine|--gentoo|--rhel|--custom <path|dev|img>\n", argv[0]);
         execl("/bin/sh", "/bin/sh", NULL);
         return 1;
     }
@@ -407,9 +397,13 @@ int main(int argc, char *argv[])
         distro = DISTRO_CUSTOM;
         snprintf(custom_path_global, sizeof(custom_path_global), "%s", argv[1] + 9);
     }
+    else if (strcmp(argv[1], "--custom") == 0 && argc == 3) {
+        distro = DISTRO_CUSTOM;
+        snprintf(custom_path_global, sizeof(custom_path_global), "%s", argv[2]);
+    }
     else {
         fprintf(stderr,
-                "Usage: %s --archlinux|--fedora|--ubuntu|--alpine|--gentoo|--rhel|--custom=<path>\n", argv[0]);
+                "Usage: %s --archlinux|--fedora|--ubuntu|--alpine|--gentoo|--rhel|--custom <path|dev|img>\n", argv[0]);
         execl("/bin/sh", "/bin/sh", NULL);
         return 1;
     }
@@ -417,10 +411,37 @@ int main(int argc, char *argv[])
     const char *target = distro_target(distro);
     LOG("distro=%s target=%s", distro_name(distro), target);
 
-    /* --- validate target --- */
+    /* --- validate target (dir, block device, or image file) --- */
     struct stat st;
-    if (stat(target, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        ERR("missing target dir: %s", target);
+    if (stat(target, &st) != 0) {
+        ERR("missing target: %s", target);
+        execl("/bin/sh", "/bin/sh", NULL);
+        return 1;
+    }
+
+    /* --- Device & Image Handling --- */
+    if (S_ISBLK(st.st_mode)) {
+        LOG("target is a block device, attempting to mount...");
+        const char *mnt_point = "/mnt/custom_root";
+        
+        if (mount_block_device(target, mnt_point) != 0) {
+            execl("/bin/sh", "/bin/sh", NULL);
+            return 1;
+        }
+        target = mnt_point;
+    } 
+    else if (S_ISREG(st.st_mode)) {
+        LOG("target is a regular file (image/squashfs), attempting loop mount...");
+        const char *mnt_point = "/mnt/custom_root";
+        
+        if (mount_file_image(target, mnt_point) != 0) {
+            execl("/bin/sh", "/bin/sh", NULL);
+            return 1;
+        }
+        target = mnt_point;
+    } 
+    else if (!S_ISDIR(st.st_mode)) {
+        ERR("target %s is neither a directory, block device, nor a regular file", target);
         execl("/bin/sh", "/bin/sh", NULL);
         return 1;
     }
